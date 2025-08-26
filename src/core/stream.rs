@@ -3,18 +3,19 @@ use actix_web::{get, web, Error, HttpResponse, Responder};
 use actix_web_lab::sse;
 use tokio::sync::broadcast;
 
-use crate::BusMessage;
+use crate::features::driving_step::DrivingStep;
 
 /* ---------- SSE with actix-web-lab (GET /stream-lab) ---------- */
 #[get("/stream-lab")]
-async fn stream_lab_events(tx: Data<broadcast::Sender<BusMessage>>) -> impl Responder {
+async fn stream_lab_events(tx: Data<broadcast::Sender<DrivingStep>>) -> impl Responder {
     let mut rx = tx.subscribe();
 
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
-                Ok(msg) => {
-                    let data = serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string());
+                Ok(driving_step) => {
+                    // Send the DrivingStep struct directly as JSON
+                    let data = serde_json::to_string(&driving_step).unwrap_or_else(|_| "{}".to_string());
                     yield Ok::<_, Error>(sse::Event::Data(sse::Data::new(data)));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -28,14 +29,15 @@ async fn stream_lab_events(tx: Data<broadcast::Sender<BusMessage>>) -> impl Resp
 
 /* ---------- SSE (GET /stream) ---------- */
 #[get("/stream")]
-async fn stream_events(tx: Data<broadcast::Sender<BusMessage>>) -> impl Responder {
+async fn stream_events(tx: Data<broadcast::Sender<DrivingStep>>) -> impl Responder {
     let mut rx = tx.subscribe();
 
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
-                Ok(msg) => {
-                    let line = format!("data: {}\n\n", serde_json::to_string(&msg).unwrap());
+                Ok(driving_step) => {
+                    // Send the DrivingStep struct directly as JSON
+                    let line = format!("data: {}\n\n", serde_json::to_string(&driving_step).unwrap());
                     yield Ok::<_, Error>(actix_web::web::Bytes::from(line));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,

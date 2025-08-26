@@ -34,7 +34,7 @@ macro_rules! internal_error {
 }
 
 internal_error!(
-    AppError: std::io::Error, sqlx::Error, actix_web::error::Error
+    AppError: std::io::Error, sqlx::Error, actix_web::error::Error, serde_json::Error
 );
 
 #[derive(Serialize)]
