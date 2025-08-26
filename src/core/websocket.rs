@@ -127,7 +127,7 @@ async fn ws_handler(
     tx: Data<broadcast::Sender<BusMessage>>,
 ) -> Result<HttpResponse, AppError> {
     let rx = tx.subscribe();
-    let pool = crate::config::sqlite::get_sqlite_pool().await?;
+    let pool = crate::config::sqlite::get_pool().await?;
     let actor = WsConn {
         rx,
         pool: pool.to_owned(),

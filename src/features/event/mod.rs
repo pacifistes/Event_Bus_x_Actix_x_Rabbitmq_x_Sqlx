@@ -1,5 +1,6 @@
 mod controller;
 pub mod model;
+mod service;
 
 use actix_web::web::Data;
 use actix_web::{get, post, web, HttpResponse};

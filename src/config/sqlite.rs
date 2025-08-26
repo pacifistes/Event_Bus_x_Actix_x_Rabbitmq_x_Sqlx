@@ -5,7 +5,7 @@ pub(crate) static SQLX_POOL: tokio::sync::OnceCell<sqlx::SqlitePool> =
     tokio::sync::OnceCell::const_new();
 
 /// Get the MongoDB client instance
-pub async fn get_sqlite_pool() -> Result<&'static SqlitePool> {
+pub async fn get_pool() -> Result<&'static SqlitePool> {
     SQLX_POOL
         .get_or_try_init(|| async {
             let sqlite_pool = SqlitePool::connect("sqlite:eventbus.db?mode=rwc").await?;
@@ -16,7 +16,7 @@ pub async fn get_sqlite_pool() -> Result<&'static SqlitePool> {
 }
 
 pub async fn init() -> Result<()> {
-    let pool = get_sqlite_pool().await?;
+    let pool = get_pool().await?;
 
     sqlx::query(
         r#"
