@@ -3,6 +3,7 @@ use lapin::{options::*, types::FieldTable, Channel, Connection, ConnectionProper
 use sqlx::Row;
 use tokio::sync::broadcast;
 use lapin::Result;
+use serde_json;
 
 use crate::core::can::CanMessage;
 use crate::features::driving_step::DrivingStep;
@@ -51,15 +52,33 @@ pub async fn consume_step_names(
     tokio::spawn(async move {
         while let Some(delivery) = consumer.next().await {
             if let Ok(delivery) = delivery {
-                if let Ok(step_name) = serde_json::from_slice::<String>(&delivery.data) {
-                    println!("📨 RabbitMQ received step_name: '{}'", step_name);
+                // Try to parse as new format with endianness
+                if let Ok(step_data) = serde_json::from_slice::<serde_json::Value>(&delivery.data) {
+                    let (step_name, endian) = if let (Some(name), Some(endian_val)) = 
+                        (step_data.get("step_name"), step_data.get("endian")) {
+                        // New format: {"step_name": "...", "endian": "..."}
+                        if let (Some(name_str), Some(endian_str)) = 
+                            (name.as_str(), endian_val.as_str()) {
+                            (name_str.to_string(), endian_str.to_string())
+                        } else {
+                            continue; // Skip malformed messages
+                        }
+                    } else {
+                        continue; // Skip malformed messages
+                    };
+
+                    println!("📨 RabbitMQ received step_name: '{}', endian: '{}'", step_name, endian);
+                    
+                    // Set environment variable for this reconstruction
+                    std::env::set_var("ENDIAN", &endian);
                     
                     // Reconstruct DrivingStep from database using step_name
                     if let Ok(pool) = crate::config::sqlite::get_pool().await {
-                        // Get the latest 7 CAN messages (should contain one complete DrivingStep)
+                        // Get the latest 7 CAN messages for the specified endianness
                         if let Ok(rows) = sqlx::query(
-                            "SELECT id, dlc, data, timestamp FROM can_messages ORDER BY timestamp DESC LIMIT 7"
+                            "SELECT id, dlc, data, timestamp FROM can_messages WHERE endian = ? ORDER BY timestamp DESC LIMIT 7"
                         )
+                        .bind(&endian)
                         .fetch_all(pool)
                         .await {
                             let mut retrieved_can_messages = Vec::new();

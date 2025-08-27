@@ -60,17 +60,77 @@ impl DrivingStep {
     const CLIMATE_FAN_CAN_ID: u16 = 0x301;
     const STEP_INFO_CAN_ID: u16 = 0x400;
 
-    /// Convert DrivingStep to multiple CAN messages
+    /// Get endianness from environment variable
+    pub fn get_endianness_from_env() -> bool {
+        match std::env::var("ENDIAN")
+            .unwrap_or_else(|_| "little".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "big" | "network" => true,
+            _ => false,
+        }
+    }
+
+    /// Helper function to encode u16 value with specified endianness
+    fn encode_u16_with_endian(value: u16, is_big_endian: bool) -> [u8; 2] {
+        if is_big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        }
+    }
+
+    /// Helper function to encode u32 value with specified endianness
+    fn encode_u32_with_endian(value: u32, is_big_endian: bool) -> [u8; 4] {
+        if is_big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        }
+    }
+
+    /// Helper function to decode u16 value with specified endianness
+    fn decode_u16_with_endian(bytes: [u8; 2], is_big_endian: bool) -> u16 {
+        if is_big_endian {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        }
+    }
+
+    /// Helper function to decode u32 value with specified endianness
+    fn decode_u32_with_endian(bytes: [u8; 4], is_big_endian: bool) -> u32 {
+        if is_big_endian {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        }
+    }
+
+    /// Convert DrivingStep to multiple CAN messages with specified endianness
     pub fn to_can_messages(&self) -> Vec<CanMessage> {
+        self.to_can_messages_with_endian(Self::get_endianness_from_env())
+    }
+
+    /// Convert DrivingStep to multiple CAN messages with explicit endianness
+    pub fn to_can_messages_with_endian(&self, is_big_endian: bool) -> Vec<CanMessage> {
         let mut messages = Vec::new();
         let timestamp = chrono::Utc::now().to_rfc3339();
 
         // Engine RPM and related data
         let mut engine_rpm_data = [0u8; 8];
-        engine_rpm_data[0] = (self.engine.rpm & 0xFF) as u8;
-        engine_rpm_data[1] = ((self.engine.rpm >> 8) & 0xFF) as u8;
-        engine_rpm_data[2] = ((self.engine.fuel_pressure / 10) & 0xFF) as u8;
-        engine_rpm_data[3] = ((self.engine.fuel_pressure / 10 >> 8) & 0xFF) as u8;
+
+        // RPM (16 bits) at bytes 0-1 with endianness
+        let rpm_bytes = Self::encode_u16_with_endian(self.engine.rpm, is_big_endian);
+        engine_rpm_data[0..2].copy_from_slice(&rpm_bytes);
+
+        // Fuel pressure (16 bits, scaled by 10) at bytes 2-3 with endianness
+        let fuel_scaled = self.engine.fuel_pressure / 10;
+        let fuel_bytes = Self::encode_u16_with_endian(fuel_scaled, is_big_endian);
+        engine_rpm_data[2..4].copy_from_slice(&fuel_bytes);
+
+        // Engine running flag at byte 4
         engine_rpm_data[4] = if self.engine.engine_running { 1 } else { 0 };
 
         messages.push(CanMessage {
@@ -82,8 +142,8 @@ impl DrivingStep {
 
         // Engine temperature data
         let mut engine_temp_data = [0u8; 8];
-        engine_temp_data[0] = ((self.engine.coolant_temp + 40).max(0).min(255)) as u8;
-        engine_temp_data[1] = ((self.engine.intake_temp + 40).max(0).min(255)) as u8;
+        engine_temp_data[0] = ((self.engine.coolant_temp + 40).max(0).min(255i16)) as u8;
+        engine_temp_data[1] = ((self.engine.intake_temp + 40).max(0).min(255i16)) as u8;
         engine_temp_data[2] = self.engine.throttle_pos;
         engine_temp_data[3] = self.engine.engine_load;
 
@@ -96,9 +156,13 @@ impl DrivingStep {
 
         // Vehicle speed and gear data
         let mut speed_data = [0u8; 8];
+
+        // Vehicle speed (16 bits, scaled by 10) at bytes 0-1 with endianness
         let speed_encoded = (self.speed.vehicle_speed * 10.0).min(6553.5) as u16;
-        speed_data[0] = (speed_encoded & 0xFF) as u8;
-        speed_data[1] = ((speed_encoded >> 8) & 0xFF) as u8;
+        let speed_bytes = Self::encode_u16_with_endian(speed_encoded, is_big_endian);
+        speed_data[0..2].copy_from_slice(&speed_bytes);
+
+        // Gear position at byte 2
         speed_data[2] = self.speed.gear_position;
 
         // Wheel speeds (simplified, 1 byte each)
@@ -117,13 +181,13 @@ impl DrivingStep {
         let mut speed_flags_data = [0u8; 8];
         let mut flags = 0u8;
         if self.speed.abs_active {
-            flags |= 0x01;
+            flags |= 0b0000_0001; // Bit 0: ABS active
         }
         if self.speed.traction_control {
-            flags |= 0x02;
+            flags |= 0b0000_0010; // Bit 1: Traction control active
         }
         if self.speed.cruise_control {
-            flags |= 0x04;
+            flags |= 0b0000_0100; // Bit 2: Cruise control active
         }
         speed_flags_data[0] = flags;
 
@@ -152,19 +216,19 @@ impl DrivingStep {
         climate_fan_data[0] = self.climate.fan_speed;
         let mut climate_flags = 0u8;
         if self.climate.ac_compressor {
-            climate_flags |= 0x01;
+            climate_flags |= 0b0000_0001; // Bit 0: AC compressor
         }
         if self.climate.heater {
-            climate_flags |= 0x02;
+            climate_flags |= 0b0000_0010; // Bit 1: Heater
         }
         if self.climate.defrost {
-            climate_flags |= 0x04;
+            climate_flags |= 0b0000_0100; // Bit 2: Defrost
         }
         if self.climate.auto_mode {
-            climate_flags |= 0x08;
+            climate_flags |= 0b0000_1000; // Bit 3: Auto mode
         }
         if self.climate.air_recirculation {
-            climate_flags |= 0x10;
+            climate_flags |= 0b0001_0000; // Bit 4: Air recirculation
         }
         climate_fan_data[1] = climate_flags;
 
@@ -175,22 +239,16 @@ impl DrivingStep {
             timestamp: timestamp.clone(),
         });
 
-        // Step info (duration, step name hash for verification)
+        // Step info (duration only, no hash)
         let mut step_info_data = [0u8; 8];
-        let duration_bytes = (self.duration_ms as u32).to_le_bytes();
-        step_info_data[0..4].copy_from_slice(&duration_bytes);
 
-        // Simple hash of step name for verification
-        let step_name_hash = self
-            .step_name
-            .bytes()
-            .fold(0u32, |acc, b| acc.wrapping_add(b as u32));
-        let hash_bytes = step_name_hash.to_le_bytes();
-        step_info_data[4..8].copy_from_slice(&hash_bytes);
+        // Duration (32 bits) at bytes 0-3 with endianness
+        let duration_bytes = Self::encode_u32_with_endian(self.duration_ms as u32, is_big_endian);
+        step_info_data[0..4].copy_from_slice(&duration_bytes);
 
         messages.push(CanMessage {
             id: Self::STEP_INFO_CAN_ID,
-            dlc: 8,
+            dlc: 4, // Only duration, no hash
             data: step_info_data,
             timestamp: timestamp.clone(),
         });
@@ -198,8 +256,17 @@ impl DrivingStep {
         messages
     }
 
-    /// Reconstruct DrivingStep from multiple CAN messages
+    /// Reconstruct DrivingStep from multiple CAN messages with default endianness
     pub fn from_can_messages(messages: &[CanMessage], step_name: String) -> Result<Self, String> {
+        Self::from_can_messages_with_endian(messages, step_name, Self::get_endianness_from_env())
+    }
+
+    /// Reconstruct DrivingStep from multiple CAN messages with explicit endianness
+    pub fn from_can_messages_with_endian(
+        messages: &[CanMessage],
+        step_name: String,
+        is_big_endian: bool,
+    ) -> Result<Self, String> {
         let mut engine_data = None;
         let mut engine_temp_data = None;
         let mut speed_data = None;
@@ -213,8 +280,15 @@ impl DrivingStep {
             match msg.id {
                 Self::ENGINE_RPM_CAN_ID => {
                     if msg.dlc >= 5 {
-                        let rpm = (msg.data[1] as u16) << 8 | (msg.data[0] as u16);
-                        let fuel_pressure = ((msg.data[3] as u16) << 8 | (msg.data[2] as u16)) * 10;
+                        // RPM (16 bits) with endianness
+                        let rpm =
+                            Self::decode_u16_with_endian([msg.data[0], msg.data[1]], is_big_endian);
+
+                        // Fuel pressure (16 bits) with endianness
+                        let fuel_raw =
+                            Self::decode_u16_with_endian([msg.data[2], msg.data[3]], is_big_endian);
+                        let fuel_pressure = (fuel_raw as u32 * 10) as u16;
+
                         let engine_running = msg.data[4] != 0;
                         engine_data = Some((rpm, fuel_pressure, engine_running));
                     }
@@ -231,7 +305,9 @@ impl DrivingStep {
                 }
                 Self::SPEED_DATA_CAN_ID => {
                     if msg.dlc >= 7 {
-                        let speed_raw = (msg.data[1] as u16) << 8 | (msg.data[0] as u16);
+                        // Vehicle speed (16 bits) with endianness
+                        let speed_raw =
+                            Self::decode_u16_with_endian([msg.data[0], msg.data[1]], is_big_endian);
                         let vehicle_speed = speed_raw as f32 / 10.0;
                         let gear_position = msg.data[2];
                         let wheel_speeds = [
@@ -246,9 +322,9 @@ impl DrivingStep {
                 Self::SPEED_FLAGS_CAN_ID => {
                     if msg.dlc >= 1 {
                         let flags = msg.data[0];
-                        let abs_active = (flags & 0x01) != 0;
-                        let traction_control = (flags & 0x02) != 0;
-                        let cruise_control = (flags & 0x04) != 0;
+                        let abs_active = (flags & 0b0000_0001) != 0; // Bit 0: ABS active
+                        let traction_control = (flags & 0b0000_0010) != 0; // Bit 1: Traction control
+                        let cruise_control = (flags & 0b0000_0100) != 0; // Bit 2: Cruise control
                         speed_flags_data = Some((abs_active, traction_control, cruise_control));
                     }
                 }
@@ -264,11 +340,11 @@ impl DrivingStep {
                     if msg.dlc >= 2 {
                         let fan_speed = msg.data[0];
                         let flags = msg.data[1];
-                        let ac_compressor = (flags & 0x01) != 0;
-                        let heater = (flags & 0x02) != 0;
-                        let defrost = (flags & 0x04) != 0;
-                        let auto_mode = (flags & 0x08) != 0;
-                        let air_recirculation = (flags & 0x10) != 0;
+                        let ac_compressor = (flags & 0b0000_0001) != 0; // Bit 0: AC compressor
+                        let heater = (flags & 0b0000_0010) != 0; // Bit 1: Heater
+                        let defrost = (flags & 0b0000_0100) != 0; // Bit 2: Defrost
+                        let auto_mode = (flags & 0b0000_1000) != 0; // Bit 3: Auto mode
+                        let air_recirculation = (flags & 0b0001_0000) != 0; // Bit 4: Air recirculation
                         climate_fan_data = Some((
                             fan_speed,
                             ac_compressor,
@@ -280,9 +356,11 @@ impl DrivingStep {
                     }
                 }
                 Self::STEP_INFO_CAN_ID => {
-                    if msg.dlc >= 8 {
+                    if msg.dlc >= 4 {
+                        // Duration (32 bits) with endianness
                         let duration_bytes = [msg.data[0], msg.data[1], msg.data[2], msg.data[3]];
-                        let duration_ms = u32::from_le_bytes(duration_bytes) as u64;
+                        let duration_ms =
+                            Self::decode_u32_with_endian(duration_bytes, is_big_endian) as u64;
                         step_info_data = Some(duration_ms);
                     }
                 }

@@ -25,6 +25,7 @@ pub async fn init() -> Result<()> {
             dlc INTEGER NOT NULL,
             data TEXT NOT NULL,
             timestamp TEXT NOT NULL,
+            endian TEXT NOT NULL,
             PRIMARY KEY (id, timestamp)
         )
         "#,

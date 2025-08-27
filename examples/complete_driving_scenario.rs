@@ -25,23 +25,31 @@ async fn store_can_messages(
     can_messages: &[CanMessage],
 ) -> Result<(), Box<dyn std::error::Error>> {
     for can_msg in can_messages {
-        sqlx::query("INSERT INTO can_messages (id, dlc, data, timestamp) VALUES (?, ?, ?, ?)")
-            .bind(can_msg.id as i64)
-            .bind(can_msg.dlc as i64)
-            .bind(serde_json::to_string(&can_msg.data)?)
-            .bind(&can_msg.timestamp)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO can_messages (id, dlc, data, timestamp, endian) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(can_msg.id as i64)
+        .bind(can_msg.dlc as i64)
+        .bind(serde_json::to_string(&can_msg.data)?)
+        .bind(&can_msg.timestamp)
+        .bind(std::env::var("ENDIAN").unwrap_or_else(|_| "little".to_string()))
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
 
-/// Send step_name to RabbitMQ
-async fn send_step_name_to_rabbitmq(
+/// Send step_name and endianness to RabbitMQ
+async fn send_step_data_to_rabbitmq(
     channel: &Channel,
     step_name: &str,
+    endian: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = serde_json::to_vec(step_name)?;
+    let step_data = serde_json::json!({
+        "step_name": step_name,
+        "endian": endian
+    });
+    let payload = serde_json::to_vec(&step_data)?;
 
     channel
         .basic_publish(
@@ -158,6 +166,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (None, None)
             }
         };
+
+    // Start stream endpoint connection in background
+    let _stream_handle = tokio::spawn(async {
+        if let Err(e) = connect_to_stream_endpoint().await {
+            println!("   ⚠️ Could not connect to stream endpoint: {}", e);
+        }
+    });
 
     // Create realistic driving scenario with all 6 steps
     let scenario = vec![
@@ -361,56 +376,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ];
 
-    // Start stream endpoint connection in background
-    let _stream_handle = tokio::spawn(async {
-        if let Err(e) = connect_to_stream_endpoint().await {
-            println!("   ⚠️ Could not connect to stream endpoint: {}", e);
-        }
-    });
+    for endian in ["little", "big"] {
+        std::env::set_var("ENDIAN", endian);
+        let is_big_endian = endian == "big";
 
-    println!(
-        "\n🎬 RUNNING COMPLETE DRIVING SCENARIO ({} steps)",
-        scenario.len()
-    );
-    println!("═══════════════════════════════════════════════════════════");
-
-    for (i, step) in scenario.iter().enumerate() {
         println!(
-            "\n📍 STEP {}/{}: Processing '{}'...",
-            i + 1,
+            "\n🎬 RUNNING COMPLETE DRIVING SCENARIO ({} steps) - {} ENDIAN",
             scenario.len(),
-            step.step_name
+            endian.to_uppercase()
         );
+        println!("═══════════════════════════════════════════════════════════");
 
-        // Convert to CAN messages
-        let can_messages = step.to_can_messages();
-        println!("\n📡 Converting to {} CAN messages...", can_messages.len());
+        for (i, step) in scenario.iter().enumerate() {
+            println!(
+                "\n📍 STEP {}/{}: Processing '{}'... ({})",
+                i + 1,
+                scenario.len(),
+                step.step_name,
+                endian
+            );
 
-        // Store CAN messages in database
-        println!(
-            "\n💾 Storing {} CAN messages to SQLite database...",
-            can_messages.len()
-        );
-        store_can_messages(&pool, &can_messages).await?;
+            // Convert to CAN messages with explicit endianness
+            let can_messages = step.to_can_messages_with_endian(is_big_endian);
+            println!(
+                "\n📡 Converting to {} CAN messages ({} endian)...",
+                can_messages.len(),
+                endian
+            );
 
-        // Wait a moment to ensure database write is committed
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Store CAN messages in database
+            println!(
+                "\n💾 Storing {} CAN messages to SQLite database...",
+                can_messages.len()
+            );
+            store_can_messages(&pool, &can_messages).await?;
 
-        // Send step_name to RabbitMQ (if available)
-        println!("\n📨 Sending step_name to RabbitMQ...");
-        if let Some(ch) = &channel {
-            match send_step_name_to_rabbitmq(ch, &step.step_name).await {
-                Ok(_) => {
-                    println!("   └─ Step name '{}' → RabbitMQ ✅", step.step_name);
+            // Wait a moment to ensure database write is committed
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            // Send step_name and endianness to RabbitMQ (if available)
+            println!("\n📨 Sending step_data to RabbitMQ...");
+            if let Some(ch) = &channel {
+                match send_step_data_to_rabbitmq(ch, &step.step_name, endian).await {
+                    Ok(_) => {
+                        println!(
+                            "   └─ Step '{}' + endian '{}' → RabbitMQ ✅",
+                            step.step_name, endian
+                        );
+                    }
+                    Err(e) => {
+                        println!("   └─ ⚠️ RabbitMQ error ({}), continuing without it", e);
+                    }
                 }
-                Err(e) => {
-                    println!("   └─ ⚠️ RabbitMQ error ({}), continuing without it", e);
-                }
+            } else {
+                println!("   └─ ⚠️ Skipping RabbitMQ (not connected)");
             }
-        } else {
-            println!("   └─ ⚠️ Skipping RabbitMQ (not connected)");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
     Ok(())
